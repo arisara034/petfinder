@@ -1,4 +1,5 @@
-node_modules/
-uploads/
-posters/
 .env
+__pycache__/
+*.pyc
+.venv/
+venv/
