@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from typing import Dict, Any
 from fastapi import Header, HTTPException
+from matching import compute_image_hash, hash_similarity_percent, combined_match_percent
+from datetime import datetime, timezone
 
 # โหลดค่าจากไฟล์ .env
 load_dotenv()
@@ -129,6 +131,51 @@ def notify_nearby_users(post_type: str, province: str | None, district: str | No
 
 
 # ==========================================
+# 🤖 SECTION 1.6: AI จับคู่รูปสัตว์หาย (lost) กับสัตว์ที่พบ (found)
+# ==========================================
+
+MATCH_NOTIFY_THRESHOLD = 55.0  # % ความเหมือนรวม (รูปภาพ + ช่วงเวลา) ขั้นต่ำที่จะแจ้งเตือนว่าอาจเจอคู่กัน
+
+def find_and_notify_matches(new_post_type: str, new_post_id, animal_type: str, image_hash, poster_id: str, new_post_date):
+    """
+    เทียบรูปโพสต์ใหม่กับโพสต์ฝั่งตรงข้าม (lost<->found ชนิดสัตว์เดียวกัน) โดยรวมคะแนนความเหมือนของรูปภาพ
+    กับความสอดคล้องของช่วงเวลาที่หาย/พบ แล้วแจ้งเตือนเจ้าของโพสต์เดิมถ้าคล้ายกันมากพอ
+    """
+    if not image_hash or not new_post_id:
+        return
+    opposite_type = "found" if new_post_type == "lost" else "lost"
+    opposite_table = "found_posts" if new_post_type == "lost" else "lost_posts"
+    # lost_posts เก็บวันที่หายไว้ที่ lost_date, found_posts ไม่มีวันที่ระบุ ใช้ created_at (วันที่โพสต์) แทนวันที่พบ
+    date_field = "lost_date" if opposite_table == "lost_posts" else "created_at"
+    try:
+        candidates = supabase.table(opposite_table) \
+            .select(f"id, user_id, image_hash, {date_field}") \
+            .eq("type", animal_type) \
+            .execute().data or []
+
+        for c in candidates:
+            if not c.get("image_hash") or not c.get("user_id") or c["user_id"] == poster_id:
+                continue
+            img_score = hash_similarity_percent(image_hash, c["image_hash"])
+            if new_post_type == "lost":
+                lost_date_str, found_date_str = new_post_date, c.get(date_field)
+            else:
+                lost_date_str, found_date_str = c.get(date_field), new_post_date
+            combined_score = combined_match_percent(img_score, lost_date_str, found_date_str)
+            if combined_score >= MATCH_NOTIFY_THRESHOLD:
+                # แจ้งเตือนเจ้าของโพสต์เดิม (ฝั่งตรงข้าม) ว่ามีโพสต์ใหม่ที่ AI ตรวจพบว่าอาจตรงกับของเขา
+                supabase.table("notifications").insert({
+                    "recipient_id": c["user_id"],
+                    "actor_id": poster_id,
+                    "type": "match",
+                    "post_type": opposite_type,
+                    "post_id": c["id"],
+                }).execute()
+    except Exception as e:
+        print(f"❌ MATCH NOTIFY ERROR: {str(e)}")
+
+
+# ==========================================
 # 📌 SECTION 2: ADOPT ENDPOINTS (ระบบประกาศหาบ้าน)
 # ==========================================
 
@@ -222,6 +269,7 @@ def create_lost_post(item: LostPostItem, authorization: str = Header(None)):
         final_images = item.images if item.images else ([item.image_url] if item.image_url else ([item.imageUrl] if item.imageUrl else []))
         final_image = final_images[0] if final_images else None
         final_reward = int(item.reward) if item.reward is not None else 0
+        image_hash = compute_image_hash(final_image)
 
         data_to_insert = {
             "name": item.name,
@@ -239,12 +287,14 @@ def create_lost_post(item: LostPostItem, authorization: str = Header(None)):
             "image_url": final_image,
             "images": final_images,
             "status": item.status if item.status else "กำลังตามหา",
-            "user_id": user_id
+            "user_id": user_id,
+            "image_hash": image_hash
         }
         response = supabase.table("lost_posts").insert(data_to_insert).execute()
 
         new_post_id = response.data[0]["id"] if response.data else None
         notify_nearby_users("lost", item.province, item.district, user_id, new_post_id)
+        find_and_notify_matches("lost", new_post_id, item.type, image_hash, user_id, final_date)
 
         return {"status": "success", "message": "ลงประกาศตามหาสำเร็จ 🎉", "data": response.data}
     except Exception as e:
@@ -279,6 +329,7 @@ def create_found_post(item: FoundPostItem, authorization: str = Header(None)):
         final_location = item.location_note if item.location_note else item.locationNote
         final_images = item.images if item.images else ([item.image_url] if item.image_url else ([item.imageUrl] if item.imageUrl else []))
         final_image = final_images[0] if final_images else None
+        image_hash = compute_image_hash(final_image)
 
         data_to_insert = {
             "type": item.type,
@@ -292,12 +343,15 @@ def create_found_post(item: FoundPostItem, authorization: str = Header(None)):
             "image_url": final_image,
             "images": final_images,
             "status": item.status if item.status else "รอเจ้าของติดต่อกลับ",
-            "user_id":user_id
+            "user_id":user_id,
+            "image_hash": image_hash
         }
         response = supabase.table("found_posts").insert(data_to_insert).execute()
 
         new_post_id = response.data[0]["id"] if response.data else None
         notify_nearby_users("found", item.province, item.district, user_id, new_post_id)
+        found_at = datetime.now(timezone.utc).isoformat()
+        find_and_notify_matches("found", new_post_id, item.type, image_hash, user_id, found_at)
 
         return {"status": "success", "message": "ส่งข้อมูลแจ้งพบสัตว์เลี้ยงสำเร็จ 🐾", "data": response.data}
     except Exception as e:
@@ -661,3 +715,73 @@ def admin_update_report(report_id: int, item: ReportStatusUpdateSchema, admin_id
         return {"status": "success", "data": response.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ไม่สามารถอัปเดตสถานะรายงานได้: {str(e)}")
+
+
+# ==========================================
+# 🤖 SECTION 10: AI จับคู่รูปสัตว์หาย ↔ สัตว์ที่พบ (Matching)
+# ==========================================
+
+MATCH_SOURCE_TABLE = {"lost": "lost_posts", "found": "found_posts"}
+MATCH_OPPOSITE = {"lost": "found", "found": "lost"}
+MATCH_DISPLAY_THRESHOLD = 60.0  # % ความเหมือนรวมขั้นต่ำที่จะแสดงผล ตัดโพสต์ที่คล้ายกันแบบผิวเผินออกไป เพื่อความแม่นยำ
+
+@app.get("/api/match/{post_type}/{post_id}")
+def get_ai_matches(post_type: str, post_id: int):
+    """หาโพสต์ฝั่งตรงข้าม (lost หาคู่ใน found, found หาคู่ใน lost) ที่รูปภาพคล้ายกัน เรียงจากเหมือนมากไปน้อย"""
+    if post_type not in MATCH_SOURCE_TABLE:
+        raise HTTPException(status_code=400, detail="ประเภทโพสต์ต้องเป็น 'lost' หรือ 'found' เท่านั้น")
+
+    source_table = MATCH_SOURCE_TABLE[post_type]
+    opposite_type = MATCH_OPPOSITE[post_type]
+    opposite_table = MATCH_SOURCE_TABLE[opposite_type]
+
+    try:
+        source_post = supabase.table(source_table).select("*").eq("id", post_id).maybe_single().execute().data
+        if not source_post:
+            raise HTTPException(status_code=404, detail="ไม่พบโพสต์นี้")
+
+        source_hash = source_post.get("image_hash")
+        if not source_hash:
+            return []
+
+        # lost_posts เก็บวันที่หายไว้ที่ lost_date, found_posts ไม่มีวันที่ระบุ ใช้ created_at (วันที่โพสต์) แทนวันที่พบ
+        source_date = source_post.get("lost_date") if post_type == "lost" else source_post.get("created_at")
+
+        candidates = supabase.table(opposite_table) \
+            .select("*") \
+            .eq("type", source_post.get("type")) \
+            .execute().data or []
+
+        results = []
+        for c in candidates:
+            img_score = hash_similarity_percent(source_hash, c.get("image_hash"))
+            if img_score <= 0:
+                continue
+            candidate_date = c.get("lost_date") if opposite_type == "lost" else c.get("created_at")
+            if post_type == "lost":
+                lost_date_str, found_date_str = source_date, candidate_date
+            else:
+                lost_date_str, found_date_str = candidate_date, source_date
+            combined_score = combined_match_percent(img_score, lost_date_str, found_date_str)
+            if combined_score < MATCH_DISPLAY_THRESHOLD:
+                continue
+            results.append({
+                "post_type": opposite_type,
+                "id": c["id"],
+                "name": c.get("name"),
+                "breed": c.get("breed"),
+                "image_url": c.get("image_url"),
+                "note": c.get("note"),
+                "status": c.get("status"),
+                "location_note": c.get("location_note"),
+                "created_at": c.get("created_at"),
+                "image_similarity_percent": img_score,
+                "similarity_percent": combined_score,
+            })
+
+        results.sort(key=lambda r: r["similarity_percent"], reverse=True)
+        return results[:8]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ไม่สามารถค้นหาการจับคู่ได้: {str(e)}")

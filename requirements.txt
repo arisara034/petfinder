@@ -4,3 +4,6 @@ httpx
 python-dotenv
 supabase
 pydantic
+Pillow
+ImageHash
+numpy
