@@ -7,3 +7,4 @@ pydantic
 Pillow
 ImageHash
 numpy
+python-multipart

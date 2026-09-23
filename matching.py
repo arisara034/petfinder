@@ -15,6 +15,12 @@ IMAGE_WEIGHT = 0.7  # น้ำหนักของความเหมือ�
 TIME_WEIGHT = 0.3   # น้ำหนักของความสอดคล้องของช่วงเวลาในคะแนนรวม
 
 
+def _hash_from_pil_image(img):
+    ahash = imagehash.average_hash(img, hash_size=HASH_SIZE)
+    dhash = imagehash.dhash(img, hash_size=HASH_SIZE)
+    return f"{ahash}:{dhash}"
+
+
 def compute_image_hash(image_url):
     """ดาวน์โหลดรูปจาก URL แล้วคำนวณ perceptual hash คืนเป็น string เก็บลง DB ได้"""
     if not image_url:
@@ -23,11 +29,21 @@ def compute_image_hash(image_url):
         resp = httpx.get(image_url, timeout=10.0, follow_redirects=True)
         resp.raise_for_status()
         img = Image.open(BytesIO(resp.content)).convert("RGB")
-        ahash = imagehash.average_hash(img, hash_size=HASH_SIZE)
-        dhash = imagehash.dhash(img, hash_size=HASH_SIZE)
-        return f"{ahash}:{dhash}"
+        return _hash_from_pil_image(img)
     except Exception as e:
         print(f"❌ IMAGE HASH ERROR: {e}")
+        return None
+
+
+def compute_image_hash_from_bytes(image_bytes):
+    """คำนวณ perceptual hash จากไฟล์รูปที่อัปโหลดเข้ามาโดยตรง (ไม่ต้องผ่าน URL) ใช้กับฟีเจอร์สแกนรูปด่วน"""
+    if not image_bytes:
+        return None
+    try:
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        return _hash_from_pil_image(img)
+    except Exception as e:
+        print(f"❌ IMAGE HASH ERROR (upload): {e}")
         return None
 
 

@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from typing import Dict, Any
 from fastapi import Header, HTTPException
-from matching import compute_image_hash, hash_similarity_percent, combined_match_percent
+from matching import compute_image_hash, compute_image_hash_from_bytes, hash_similarity_percent, combined_match_percent
+from fastapi import File, UploadFile, Form
 from datetime import datetime, timezone
 
 # โหลดค่าจากไฟล์ .env
@@ -785,3 +786,50 @@ def get_ai_matches(post_type: str, post_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ไม่สามารถค้นหาการจับคู่ได้: {str(e)}")
+
+
+SCAN_MATCH_THRESHOLD = 55.0  # % ความเหมือนขั้นต่ำที่จะถือว่าเป็นการจับคู่ที่ใช้ได้ สำหรับฟีเจอร์สแกนรูปด่วนหน้าแรก
+
+@app.post("/api/match/scan")
+async def scan_photo_for_match(file: UploadFile = File(...), animal_type: str = Form(...)):
+    """
+    ฟีเจอร์ 'สแกนรูปด่วน' หน้าแรก: อัปโหลดรูปสัตว์ที่เจอ ระบบจะเทียบกับประกาศ 'สัตว์หาย' (lost_posts)
+    ที่เป็นสัตว์ชนิดเดียวกันทั้งหมด แล้วคืนโพสต์ที่รูปเหมือนที่สุด (ถ้ามีเหมือนพอ)
+    """
+    if animal_type not in ("สุนัข", "แมว"):
+        raise HTTPException(status_code=400, detail="กรุณาระบุชนิดสัตว์เป็น 'สุนัข' หรือ 'แมว'")
+
+    try:
+        image_bytes = await file.read()
+        upload_hash = compute_image_hash_from_bytes(image_bytes)
+        if not upload_hash:
+            raise HTTPException(status_code=400, detail="ไม่สามารถอ่านไฟล์รูปภาพนี้ได้ ลองอัปโหลดรูปใหม่อีกครั้ง")
+
+        candidates = supabase.table("lost_posts") \
+            .select("*") \
+            .eq("type", animal_type) \
+            .execute().data or []
+
+        best = None
+        for c in candidates:
+            if not c.get("image_hash"):
+                continue
+            score = hash_similarity_percent(upload_hash, c["image_hash"])
+            if score >= SCAN_MATCH_THRESHOLD and (best is None or score > best["similarity_percent"]):
+                best = {
+                    "post_type": "lost",
+                    "id": c["id"],
+                    "name": c.get("name"),
+                    "breed": c.get("breed"),
+                    "image_url": c.get("image_url"),
+                    "location_note": c.get("location_note"),
+                    "province": c.get("province"),
+                    "district": c.get("district"),
+                    "similarity_percent": score,
+                }
+
+        return {"match": best}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"สแกนรูปภาพไม่สำเร็จ: {str(e)}")
